@@ -26,6 +26,12 @@ import numpy as np
 from .normalization import ConditionalInstanceNorm2dPlus
 
 
+class Swish(nn.Module):
+    """Swish activation function: x * sigmoid(x)"""
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+
 def get_act(config):
   """Get activation functions from the config file."""
 
@@ -36,7 +42,12 @@ def get_act(config):
   elif config.model.nonlinearity.lower() == 'lrelu':
     return nn.LeakyReLU(negative_slope=0.2)
   elif config.model.nonlinearity.lower() == 'swish':
-    return nn.SiLU()
+    # Use SiLU if available, otherwise use Swish implementation
+    try:
+      return nn.SiLU()
+    except AttributeError:
+      # Fallback for older PyTorch versions
+      return Swish()
   else:
     raise NotImplementedError('activation function does not exist!')
 

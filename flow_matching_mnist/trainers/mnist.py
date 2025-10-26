@@ -6,8 +6,6 @@ from torchvision import datasets, transforms
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-
-# 导入NCSN++
 from models import ncsnpp
 from models import utils as mutils
 from models import ema as ema
@@ -18,8 +16,12 @@ class FlowMatchingNCSNpp:
     def __init__(self, config, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.device = device
         self.config = config
-        
-        self.model = mutils.create_model(config).to(device)
+            
+        model = mutils.create_model(config)
+        if hasattr(model, 'module'):
+            self.model = model.module.to(device)
+        else:
+            self.model = model.to(device)
 
         self.optimizer = optim.AdamW(
             self.model.parameters(), 
@@ -36,8 +38,8 @@ class FlowMatchingNCSNpp:
         """
         Compute the optimal transport flow (CFM with linear interpolation)
         Args:
-            x0: Source distribution samples (noise) - 连续值
-            x1: Target distribution samples (data) - 连续值 [0,1]
+            x0: Source distribution samples (noise) - [0,1]
+            x1: Target distribution samples (data) - [0,1]
             t: Time values in [0, 1]
         Returns:
             xt: Interpolated samples at time t
@@ -45,7 +47,7 @@ class FlowMatchingNCSNpp:
         """
         t = t.view(-1, 1, 1, 1)
         xt = (1 - t) * x0 + t * x1
-        ut = x1 - x0  # 目标velocity
+        ut = x1 - x0  # target velocity
         return xt, ut
     
     def train_step(self, x1):
@@ -54,12 +56,15 @@ class FlowMatchingNCSNpp:
         
         x0 = torch.randn_like(x1, device=self.device)
         
-        t = torch.rand(batch_size, device=self.device)
+        # 确保时间参数形状正确 [batch_size, 1, 1, 1] 用于广播
+        t = torch.rand(batch_size, device=self.device).view(-1, 1, 1, 1)
         
         xt, ut = self.optimal_transport_flow(x0, x1, t)
         
-
-        vt = self.model(xt, t)
+        # 模型期望时间参数为标量值，不是广播形状
+        t_scalar = t.view(-1)  # 重新整形为 [batch_size]
+        
+        vt = self.model(xt, t_scalar)
         
         loss = nn.MSELoss()(vt, ut)
         
@@ -78,6 +83,32 @@ class FlowMatchingNCSNpp:
         self.ema.update(self.model.parameters())
         
         return loss.item()
+    
+    @torch.no_grad()
+    def validate(self, dataloader):
+        """Validate the model on validation set"""
+        self.model.eval()
+        total_loss = 0
+        n_batches = 0
+        
+        for x, _ in dataloader:
+            x = x.to(self.device)
+            x = x * 2.0 - 1.0  # Convert to [-1, 1]
+            
+            batch_size = x.shape[0]
+            x0 = torch.randn_like(x, device=self.device)
+            t = torch.rand(batch_size, device=self.device).view(-1, 1, 1, 1)
+            
+            xt, ut = self.optimal_transport_flow(x0, x, t)
+            t_scalar = t.view(-1)
+            vt = self.model(xt, t_scalar)
+            
+            loss = nn.MSELoss()(vt, ut)
+            total_loss += loss.item()
+            n_batches += 1
+        
+        self.model.train()
+        return total_loss / n_batches if n_batches > 0 else 0
     
     @torch.no_grad()
     def sample(self, n_samples=16, n_steps=100, use_ema=True):
@@ -156,10 +187,8 @@ class FlowMatchingNCSNpp:
             pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{n_epochs}')
             for x, _ in pbar:
                 x = x.to(self.device)
-                
-                # 数据归一化到[-1, 1]或[0, 1] (根据你的config)
-                # NCSN++通常期望数据在[-1, 1]
-                x = x * 2.0 - 1.0  # [0,1] -> [-1,1]
+                # normalize to [-1,1]
+                x = x * 2.0 - 1.0
                 
                 loss = self.train_step(x)
                 epoch_loss += loss
@@ -176,16 +205,20 @@ class FlowMatchingNCSNpp:
                     n_steps=100,
                     save_every=10
                 )
-                self.plot_samples(final_samples, epoch+1)
+                self.plot_samples(final_samples, epoch+1, './samples')
     
-    def plot_samples(self, samples, epoch):
+    def plot_samples(self, samples, epoch, save_dir='./samples'):
         """Plot generated samples"""
+        import os
+        
+        # Create directory if it doesn't exist
+        os.makedirs(save_dir, exist_ok=True)
+        
         samples = samples.cpu().numpy()
         
         # de-normalize: [-1,1] -> [0,1]
         samples = (samples + 1.0) / 2.0
         samples = np.clip(samples, 0, 1)
-        
         fig, axes = plt.subplots(4, 4, figsize=(8, 8))
         for i, ax in enumerate(axes.flat):
             if i < len(samples):
@@ -194,5 +227,8 @@ class FlowMatchingNCSNpp:
         
         plt.suptitle(f'Generated Samples - Epoch {epoch}')
         plt.tight_layout()
-        plt.savefig(f'samples/epoch_{epoch:03d}.png', dpi=150)
+        
+        save_path = os.path.join(save_dir, f'epoch_{epoch:03d}.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
+        print(f'✅ Saved samples: {save_path}')

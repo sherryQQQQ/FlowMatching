@@ -8,44 +8,37 @@ import ml_collections
 from trainers.mnist import FlowMatchingNCSNpp
 from configs.flow_matching_mnist import get_config
 
-def get_dataloader(config):
+def get_dataloader(config, split='train'):
     transform = transforms.Compose([
         transforms.Resize(config.data.image_size),
         transforms.ToTensor(),
-
     ])
     
-    train_dataset = datasets.MNIST(
+    dataset = datasets.MNIST(
         root='./data',
-        train=True,
+        train=(split == 'train'),
         download=True,
         transform=transform
     )
     
-    train_loader = DataLoader(
-        train_dataset,
+    dataloader = DataLoader(
+        dataset,
         batch_size=config.training.batch_size,
-        shuffle=True,
+        shuffle=(split == 'train'),
         num_workers=4,
         pin_memory=True,
         drop_last=True
     )
-    
-    return train_loader
+    return dataloader
 
 def main():
-    parser = argparse.ArgumentParser(description='Flow Matching with NCSN++')
+    parser = argparse.ArgumentParser(description='Train Flow Matching model with NCSN++')
     parser.add_argument('--config', type=str, default='mnist', 
                        help='Config name')
     parser.add_argument('--workdir', type=str, default='./workdir',
                        help='Working directory')
-    parser.add_argument('--mode', type=str, default='train',
-                       choices=['train', 'sample'],
-                       help='Mode: train or sample')
     parser.add_argument('--n_epochs', type=int, default=None,
                        help='Number of epochs (overrides config)')
-    parser.add_argument('--n_samples', type=int, default=64,
-                       help='Number of samples to generate')
     parser.add_argument('--checkpoint', type=str, default=None,
                        help='Checkpoint path to resume from')
     args = parser.parse_args()
@@ -74,50 +67,58 @@ def main():
             flow_model.optimizer.load_state_dict(checkpoint['optimizer'])
         print('Checkpoint loaded successfully!')
     
-    if args.mode == 'train':
-        print('Loading MNIST dataset...')
-        train_loader = get_dataloader(config)
-        print(f'Dataset size: {len(train_loader.dataset)}')
-        print(f'Batch size: {config.training.batch_size}')
-        print(f'Number of batches: {len(train_loader)}')
-        
-        print(f'\nStarting training for {config.training.n_epochs} epochs...')
-        train_with_checkpoints(flow_model, train_loader, config, args.workdir)
-        
-    elif args.mode == 'sample':
-        print(f'Generating {args.n_samples} samples...')
-        samples = flow_model.sample(
-            n_samples=args.n_samples,
-            n_steps=config.sampling.n_steps,
-            use_ema=True
-        )
-        
-        save_path = os.path.join(args.workdir, 'samples', 'generated_samples.png')
-        flow_model.plot_samples(samples, 'final')
-        print(f'Samples saved to {save_path}')
+    print('Loading MNIST dataset...')
+    train_loader = get_dataloader(config, 'train')
+    val_loader = get_dataloader(config, 'val')
+    print(f'Training dataset size: {len(train_loader.dataset)}')
+    print(f'Validation dataset size: {len(val_loader.dataset)}')
+    print(f'Batch size: {config.training.batch_size}')
+    print(f'Number of training batches: {len(train_loader)}')
+    print(f'Number of validation batches: {len(val_loader)}')
+    
+    print(f'\nStarting training for {config.training.n_epochs} epochs...')
+    train_with_checkpoints(flow_model, train_loader, val_loader, config, args.workdir)
 
-def train_with_checkpoints(flow_model, dataloader, config, workdir):
+def train_with_checkpoints(flow_model, train_loader, val_loader, config, workdir):
     from tqdm import tqdm
     import matplotlib.pyplot as plt
+    
+    # Initialize loss tracking
+    train_losses = []
+    val_losses = []
+    epochs = []
     
     flow_model.model.train()
     
     for epoch in range(config.training.n_epochs):
-        epoch_loss = 0
+        epoch_train_loss = 0
         n_batches = 0
         
-        pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{config.training.n_epochs}')
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{config.training.n_epochs}')
         for x, _ in pbar:
             x = x.to(flow_model.device)
             x = x * 2.0 - 1.0
             
             loss = flow_model.train_step(x)
-            epoch_loss += loss
+            epoch_train_loss += loss
             n_batches += 1
             pbar.set_postfix({'loss': f'{loss:.4f}'})
         
-        avg_loss = epoch_loss / n_batches
-        print(f'Epoch {epoch+1}/{config.training.n_epochs}, Average Loss: {avg_loss:.4f}')
+        avg_train_loss = epoch_train_loss / n_batches
+        
+        # Validation phase
+        print('Validating...')
+        val_loss = flow_model.validate(val_loader)
+        
+        # Record losses
+        train_losses.append(avg_train_loss)
+        val_losses.append(val_loss)
+        epochs.append(epoch + 1)
+        
+        print(f'Epoch {epoch+1}/{config.training.n_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        
+        # Plot and save loss curves
+        plot_loss_curves(epochs, train_losses, val_losses, workdir)
         
         if (epoch + 1) % 10 == 0:
             checkpoint_path = os.path.join(
@@ -158,7 +159,7 @@ def save_samples(samples, epoch, save_dir):
     
     samples = samples.cpu().numpy()
     
-    # 反归一化: [-1,1] -> [0,1]
+    # [-1,1] -> [0,1]
     samples = (samples + 1.0) / 2.0
     samples = np.clip(samples, 0, 1)
     
@@ -211,6 +212,38 @@ def plot_generation_process(trajectory, epoch, save_dir):
     plt.close()
     
     print(f'✅ Saved generation process: {save_path}')
+
+def plot_loss_curves(epochs, train_losses, val_losses, workdir):
+    """Plot training and validation loss curves"""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    plt.figure(figsize=(10, 6))
+    
+    # Plot training loss
+    plt.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2, marker='o', markersize=4)
+    
+    # Plot validation loss
+    plt.plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2, marker='s', markersize=4)
+    
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('Training and Validation Loss Curves', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    
+    # Set y-axis to start from 0 for better visualization
+    plt.ylim(bottom=0)
+    
+    # Add some padding
+    plt.tight_layout()
+    
+    # Save the plot
+    save_path = os.path.join(workdir, 'loss_curves.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f'✅ Loss curves saved to: {save_path}')
 
 if __name__ == '__main__':
     main()

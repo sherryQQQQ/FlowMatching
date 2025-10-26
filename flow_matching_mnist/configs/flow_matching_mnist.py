@@ -44,7 +44,6 @@ def get_config():
     model.fourier_scale = 16.0
     model.conv_size = 3
     
-    # 激活函数和归一化
     model.nonlinearity = 'swish'
     model.normalization = 'GroupNorm'
     model.num_groups = 32
