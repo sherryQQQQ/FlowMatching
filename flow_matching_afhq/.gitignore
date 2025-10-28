@@ -1,0 +1,12 @@
+*/__pycache__/
+*/data/
+*/workdir/
+*/samples/
+*/checkpoints/
+*/loss_curves.png
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
